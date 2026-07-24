@@ -490,9 +490,17 @@ async def _categorized_x_post_check() -> None:
 
 async def _x_post_dispatch_check() -> None:
     """X_POST_SELF_TIMING_SPEC フェーズC(配信ディスパッチャ): 予約時刻に達した
-    (scheduled_at<=now)pending 投稿を、配信直前に opsec フィルタ(層1/層2)と
-    Executive Gate を再適用の上で実際に出す。shadow ではログのみ、live では
-    post_tweet→record_post。弾かれたら skipped。高頻度 interval で回る。"""
+    (scheduled_at<=now)pending 投稿を、配信直前に opsec 判定＋書き直し
+    (X_OPSEC_LLM_REWRITE_SPEC)・記憶 private 値チェック・Executive Gate を
+    再適用の上で実際に出す。shadow ではログのみ、live では post_tweet→
+    record_post。弾かれたら skipped。高頻度 interval で回る。
+
+    opsec は正規表現マッチをやめ、rewrite_for_opsec() の LLM 一回で「actionable
+    な具体だけを書き直して除去」する(機材/自己言及/記憶確認は保持)。素通し
+    ではなく安全な投稿へ直すため、changed でも skip せず safe_text を投稿する。
+    正規表現バックストップは置かない(フィルタ重ねがけが目詰まりの原因だった
+    ため)。記憶 private 値の逐語一致(filter_private_facts)と Gate は別責務
+    として残す。"""
     from datetime import datetime, timezone  # noqa: PLC0415
 
     from app.services.executive_gate import evaluate_executive_gate  # noqa: PLC0415
@@ -501,8 +509,9 @@ async def _x_post_dispatch_check() -> None:
         mark_posted,
         mark_skipped,
     )
+    from app.services.x_opsec_rewrite import rewrite_for_opsec  # noqa: PLC0415
     from app.services.x_post_generator import record_post  # noqa: PLC0415
-    from app.services.x_privacy_filter import filter_private_facts, filter_private_info  # noqa: PLC0415
+    from app.services.x_privacy_filter import filter_private_facts  # noqa: PLC0415
     from app.services.x_publisher import get_publisher  # noqa: PLC0415
 
     try:
@@ -520,13 +529,19 @@ async def _x_post_dispatch_check() -> None:
             category = str(post.get("category") or "")
             score = float(post.get("score") or 0.0)
 
-            # 配信直前の再フィルタ(決定時から状況が変わっている場合の安全)。
-            privacy_ok, detected = filter_private_info(text)
-            if not privacy_ok:
-                await mark_skipped(post_id, reason=f"privacy: {', '.join(detected)}")
-                logger.info("X dispatch: skipped id=%s privacy=%s", post_id, detected)
+            # 配信直前の opsec 判定＋書き直し(決定時から状況が変わっている
+            # 場合の安全)。actionable な具体だけを safe_text から除去する。
+            opsec = await rewrite_for_opsec(text)
+            safe_text = opsec.safe_text
+            # パース/呼び出し失敗の安全側(safe_text 空)は、素通しさせず保留。
+            if not safe_text.strip():
+                await mark_skipped(post_id, reason=f"opsec_hold: {', '.join(opsec.removed)}")
+                logger.info("X dispatch: skipped id=%s opsec_hold=%s", post_id, opsec.removed)
                 continue
-            facts_ok, blocked = await filter_private_facts(text, jwt)
+
+            # 記憶 private 値の逐語一致は opsec とは別責務として残す(書き直し
+            # 後のテキストに対して確認する)。
+            facts_ok, blocked = await filter_private_facts(safe_text, jwt)
             if not facts_ok:
                 await mark_skipped(post_id, reason=f"private_facts: {', '.join(blocked)}")
                 logger.info("X dispatch: skipped id=%s private_facts=%s", post_id, blocked)
@@ -540,15 +555,19 @@ async def _x_post_dispatch_check() -> None:
 
             if not settings.x_categorized_post_live:
                 logger.info(
-                    "[shadow mode] would post now (scheduled_at=%s, category=%s, text=%s)",
-                    post.get("scheduled_at"), category, text,
+                    "[shadow mode] would post now (scheduled_at=%s, category=%s, "
+                    "opsec_changed=%s, removed=%s, original=%s, safe_text=%s)",
+                    post.get("scheduled_at"), category, opsec.changed, opsec.removed,
+                    text, safe_text,
                 )
                 await mark_posted(post_id)
                 continue
 
-            tweet_id = await publisher.post_tweet(text)
+            tweet_id = await publisher.post_tweet(safe_text)
             if tweet_id:
-                await record_post(text, category, score=score, tweet_id=tweet_id)
+                # 実際に投稿した書き直し後テキストを履歴に残す(類似度判定・
+                # 表示が、投稿された内容と一致するように)。
+                await record_post(safe_text, category, score=score, tweet_id=tweet_id)
                 await mark_posted(post_id, tweet_id=tweet_id)
                 logger.info(
                     "X dispatch: posted id=%s category=%s tweet_id=%s", post_id, category, tweet_id,

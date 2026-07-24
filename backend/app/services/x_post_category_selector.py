@@ -64,56 +64,27 @@ _BALANCE_SKEW_THRESHOLD = 2.0
 _BALANCE_MIN_TOTAL = 2
 
 
-# ─── 機微 confirm_candidate の除外(層1・本丸) ────────────────────────
-# 公開Xの A_spontaneous_remark(開発者へ公開で問いかける投稿)の素材から、
-# 野ざらしにするとマズい"具体的な秘密"を含む記憶確認候補を除外する。除外
-# しても捨てず、active_inquiry(アプリ内)が独立に get_confirmation_candidates()
-# を読んで同じ候補を非公開で聞くため、追加の配線は不要(=公開から外すだけ)。
+# ─── 層1:候補選定段階では opsec 除外をしない(X_OPSEC_LLM_REWRITE_SPEC) ──
+# 【方針転換】旧実装は、公開Xの A_spontaneous_remark(開発者へ公開で問いかける
+# 投稿)の素材から、機微な"具体的な秘密"を含む記憶確認候補を、単語/正規表現
+# (旧: 広いインフラ語、その後: x_privacy_filter.filter_private_info())で
+# 除外していた。だがこの入口での除外が、機材の存在レベルの確認(「自宅サーバーで
+# GTX1660 を動かしてる、合ってる?」等)まで巻き込み、公開材料が全滅して
+# 「投稿なし」の目詰まりを起こしていた(X_OPSEC_LAYER1_REFINE の「8件全除外」)。
 #
-# 【線引き(X_OPSEC_LAYER1_REFINE)】旧実装は environment/devices カテゴリ＋広い
-# インフラ語(server/ubuntu/gpu/gtx/router/ip…)で除外していたが、これは広すぎて
-# 機材の存在レベルの確認(「自宅サーバーで GTX1660 を動かしてる、合ってる?」等)
-# まで全部非公開にしてしまい、公開材料が残らなくなった。そこで判定を層2と同じ
-# actionable 基準に揃える: 候補の value/key に対し、配信直前と同じ
-# x_privacy_filter.filter_private_info() を呼び、
-#   - safe=False(IP/認証情報/ポート/回線の具体設定/メール・電話 等を検出)→除外
-#   - safe=True (機材・一般構成・存在レベルの言及のみ)→公開Aに通す
-# 機材語だけでの除外はしない。これで層1(素材の入口)と層2(配信直前のテキスト)
-# が同一基準に揃う。
-
-
-def _is_sensitive_confirm_candidate(candidate: dict[str, Any]) -> bool:
-    # 層2と同一の actionable 検出(正規表現のみ・LLM非依存・同期)を候補の
-    # value/key にかける。safe=False(=具体的な秘密を検出)なら公開から外す。
-    from app.services.x_privacy_filter import filter_private_info  # noqa: PLC0415
-
-    text = " ".join(
-        str(candidate.get(field) or "") for field in ("key", "value")
-    ).strip()
-    if not text:
-        return False
-    safe, _detected = filter_private_info(text)
-    return not safe
+# そこで opsec は、候補選定ではなく配信直前の LLM 判定＋書き直し
+# (x_opsec_rewrite.rewrite_for_opsec())へ一本化する。ここでは素材を一切
+# 除外せず素通しする——actionable な具体は、配信直前に「その部分だけ自然に
+# 書き直して除去」される。機材/自己言及/記憶確認は公開Aに残る。
+#
+# 記憶確認の公開挙動そのもの(A素材に confirm_candidates を載せる)は不変。
 
 
 def _public_safe_confirm_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """公開A素材に載せてよい(=機微でない)confirm_candidate だけを返す。
-    除外された候補は active_inquiry がアプリ内で拾うため、ここでは捨てて
-    構わない(公開経路から外すのが目的)。"""
-    safe: list[dict[str, Any]] = []
-    dropped = 0
-    for c in candidates:
-        if _is_sensitive_confirm_candidate(c):
-            dropped += 1
-        else:
-            safe.append(c)
-    if dropped:
-        logger.info(
-            "x_post_category_selector: excluded %d sensitive confirm candidate(s) "
-            "from public A material (routed to in-app active_inquiry)",
-            dropped,
-        )
-    return safe
+    """公開A素材に載せる confirm_candidate を返す。opsec の除外は行わず
+    素通しする(actionable な具体の除去は、配信直前の LLM 書き直しに委ねる。
+    X_OPSEC_LLM_REWRITE_SPEC)。関数は呼び出し側の互換のために残している。"""
+    return list(candidates)
 
 
 def _today_start_iso() -> str:
@@ -349,10 +320,10 @@ async def select_post_category(*, jwt: str) -> tuple[str | None, str, CategoryCo
     identity_statement = (self_model or {}).get("identity_statement") or ""
     design_topic = _pick_design_philosophy_topic(recent_texts)
 
-    # X_POST_OPSEC_FILTER_SPEC 層1(本丸): 自宅インフラ/環境/機器系の記憶
-    # 確認候補は公開Aの素材から除外する(active_inquiry がアプリ内で拾う)。
-    # 非機微の候補が1件も残らなければ A は eligible に入れない(=他カテゴリへ
-    # フォールバックする既存挙動を尊重)。
+    # 層1(X_OPSEC_LLM_REWRITE_SPEC): 候補選定段階では opsec 除外をしない
+    # (素材を残し、actionable な具体の除去は配信直前の LLM 書き直しに委ねる)。
+    # 候補が1件も無ければ A は eligible に入れない(=他カテゴリへフォール
+    # バックする既存挙動を尊重)のは従来どおり。
     public_safe_confirm_candidates = _public_safe_confirm_candidates(confirm_candidates)
 
     eligible: dict[str, CategoryContext] = {}

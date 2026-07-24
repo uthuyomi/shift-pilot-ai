@@ -72,6 +72,11 @@ class Settings(BaseSettings):
     x_post_dispatch_interval_min: int = 10   # 配信ディスパッチャの実行間隔(分)
     x_post_schedule_horizon_h: int = 24      # 予約できる最長の地平線(時間先)
     x_post_min_interval_min: int = 90        # 予約同士の最小間隔(分)
+    # X_OPSEC_LLM_REWRITE_SPEC: 配信直前の opsec 判定＋書き直し(actionable な
+    # 具体だけを除去)に使う LLM モデルの明示上書き。None(既定)の場合は生成と
+    # 同じモデル階層(LLMRouter の TaskType.ROUTING → openai_model、または
+    # Ollama)を使う。将来ローカル LLM へ寄せるための差し込み口。
+    x_opsec_llm_model: str | None = None
     sigmaris_launch_date: str | None = None
     github_token: str | None = None  # research_agent.py's GitHub trending-repo search (rate-limit headers only)
     # Phase F-3 (docs/sigmaris/phase_f_report.md): 承認後のPR作成専用の、
