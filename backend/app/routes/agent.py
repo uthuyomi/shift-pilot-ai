@@ -799,6 +799,52 @@ async def proactive_trigger(
     return {"ok": True, "action": "research", "result": result}
 
 
+# ─── /api/agent/opsec/ ────────────────────────────────────────────────────────
+#
+# X_OPSEC_TEST_HOOK_SPEC: 任意テキストを実モデルで opsec 判定
+# (x_opsec_rewrite.rewrite_for_opsec())に掛けて結果を返す、認証付きの診断
+# エンドポイント。live 前(shadow のうち)に「危ない具体が本当に書き直しで
+# 消えるか / 無害文が素通しされるか」を、予約時刻を待たずその場で確認する
+# ための道具。standalone スクリプト(別プロセスでの JWT desync 障害の原因)は
+# 追加せず、稼働中の uvicorn プロセス内で実行する。認証は既存 trigger と同じ
+# _require_jwt に揃える(=公開しない)。rewrite_for_opsec は LLM router のみで
+# JWT/Supabase を触らないため、その障害系統とは無関係。
+
+
+class OpsecTestRequest(BaseModel):
+    text: str = Field(description="opsec 判定に掛ける投稿文候補")
+
+
+@router.post("/opsec/test")
+async def opsec_test(
+    payload: OpsecTestRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_jwt(authorization)
+
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "text is required and must be non-empty."},
+        )
+
+    from app.services.x_opsec_rewrite import rewrite_for_opsec  # noqa: PLC0415
+    try:
+        res = await rewrite_for_opsec(payload.text)
+    except Exception as exc:
+        logger.exception("opsec/test rewrite_for_opsec failed")
+        raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
+    return {
+        "ok": True,
+        "original": payload.text,
+        "safe_text": res.safe_text,
+        "changed": res.changed,
+        "removed": res.removed,
+        "model": getattr(res, "model", None),  # 実際に判定に使ったモデル名
+    }
+
+
 # ─── /api/agent/self/ ────────────────────────────────────────────────────────
 
 
