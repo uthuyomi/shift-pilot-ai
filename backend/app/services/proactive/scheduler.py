@@ -556,9 +556,9 @@ async def _x_post_dispatch_check() -> None:
             if not settings.x_categorized_post_live:
                 logger.info(
                     "[shadow mode] would post now (scheduled_at=%s, category=%s, "
-                    "opsec_changed=%s, removed=%s, original=%s, safe_text=%s)",
-                    post.get("scheduled_at"), category, opsec.changed, opsec.removed,
-                    text, safe_text,
+                    "opsec_model=%s, opsec_changed=%s, removed=%s, original=%s, safe_text=%s)",
+                    post.get("scheduled_at"), category, opsec.model, opsec.changed,
+                    opsec.removed, text, safe_text,
                 )
                 await mark_posted(post_id)
                 continue

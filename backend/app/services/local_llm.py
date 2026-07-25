@@ -143,6 +143,14 @@ class TaskType(str, enum.Enum):
     # _LOCAL_TASK_TYPES・_openai_model_for_task両方に、SUMMARIZEと同じ扱いで
     # 追加)。
     CAPABILITY_SUMMARIZATION = "capability_summarization"
+    # X_OPSEC_MODEL_WIRING_FIX_SPEC: 配信直前の opsec 判定＋書き直し
+    # (x_opsec_rewrite.rewrite_for_opsec())専用のタスク。これは "安いルー
+    # ティング判断" ではなく "安全判断" なので、ROUTING(最安の nano ティア)
+    # には乗せない。_openai_model_for_task() で生成モデル相当(openai_model)へ
+    # 解決し、_LOCAL_TASK_TYPES にも入れない(安全判断を Ollama 任せにせず
+    # OpenAI 固定)。X_OPSEC_LLM_MODEL / rewrite_for_opsec(model=) の明示上書き
+    # は、LLMRouter.chat(override_model=) 経由でこの既定より優先される。
+    X_OPSEC_REWRITE = "x_opsec_rewrite"
 
 
 _LOCAL_TASK_TYPES = {
@@ -280,6 +288,11 @@ def _openai_model_for_task(task: TaskType) -> str:
         TaskType.CAPABILITY_SUMMARIZATION,
     }:
         return settings.openai_nano_model
+    if task is TaskType.X_OPSEC_REWRITE:
+        # X_OPSEC_MODEL_WIRING_FIX_SPEC: opsec の安全判断は nano(最安)に
+        # 乗せず、生成モデル相当(openai_model)を既定にする。X_OPSEC_LLM_MODEL
+        # で明示上書き可(override_model 経由でこれより優先される)。
+        return settings.openai_model
     return settings.openai_model
 
 
@@ -297,8 +310,14 @@ class _OpenAIAdapter:
         max_tokens: int = 1024,
         json_mode: bool = False,
         task: TaskType | None = None,
+        override_model: str | None = None,
     ) -> str:
-        model = _openai_model_for_task(task) if task is not None else settings.openai_model
+        # override_model(明示指定)を最優先。無ければ task のティア、さらに
+        # 無ければ通常会話モデル。X_OPSEC_MODEL_WIRING_FIX_SPEC: これにより
+        # X_OPSEC_LLM_MODEL / rewrite_for_opsec(model=) が実際に効く。
+        model = override_model or (
+            _openai_model_for_task(task) if task is not None else settings.openai_model
+        )
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -356,10 +375,18 @@ class LLMRouter:
         temperature: float = 0.3,
         max_tokens: int = 1024,
         json_mode: bool = False,
+        override_model: str | None = None,
     ) -> str:
-        backend = await self._get_backend(task)
+        # override_model が指定された場合は、そのモデル名(OpenAI モデルの
+        # 想定)で必ず OpenAI 経路を使う。Ollama にローカルモデル名でない値を
+        # 渡しても解釈できないため、明示上書きは OpenAI 固定にする
+        # (X_OPSEC_MODEL_WIRING_FIX_SPEC)。
+        backend = self._openai if override_model else await self._get_backend(task)
         backend_name = "local" if isinstance(backend, LocalLLMClient) else "openai"
-        logger.debug("LLMRouter task=%s backend=%s", task.value, backend_name)
+        logger.debug(
+            "LLMRouter task=%s backend=%s override_model=%s",
+            task.value, backend_name, override_model,
+        )
         if isinstance(backend, _OpenAIAdapter):
             return await backend.chat(
                 messages,
@@ -367,6 +394,7 @@ class LLMRouter:
                 max_tokens=max_tokens,
                 json_mode=json_mode,
                 task=task,
+                override_model=override_model,
             )
         return await backend.chat(
             messages,
@@ -374,6 +402,22 @@ class LLMRouter:
             max_tokens=max_tokens,
             json_mode=json_mode,
         )
+
+    async def resolve_model_name(
+        self, task: TaskType, *, override_model: str | None = None
+    ) -> str:
+        """chat() が実際に使うモデル/バックエンドの表示名を返す(可観測性用)。
+
+        override_model があれば必ず OpenAI 経路(そのモデル名)。無ければ
+        task の解決先——ローカル eligible かつ Ollama 到達可能なら Ollama、
+        そうでなければ OpenAI のティア。chat() と同じ判定順序をなぞる。
+        """
+        if override_model:
+            return f"openai:{override_model}"
+        backend = await self._get_backend(task)
+        if isinstance(backend, LocalLLMClient):
+            return f"ollama:{settings.ollama_model}"
+        return f"openai:{_openai_model_for_task(task)}"
 
 
 # Module-level singleton — created lazily to avoid import-time side effects.

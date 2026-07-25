@@ -15,11 +15,15 @@
 # Gate(既存)。正規表現のバックストップは、意図的に置かない(目詰まりの
 # 再来を避けるため。判断根拠は X_OPSEC_LLM_REWRITE_SPEC)。
 #
-# 【将来のローカル LLM への差し替え口】判定は既存の LLMRouter を通す
-# (TaskType.ROUTING → 生成と同じモデル階層。LOCAL_LLM_ENABLED のとき
-# Ollama、無ければ OpenAI へ自動フォールバック)。モデル解決だけを
-# _resolve_model() の 1 箇所に集約し、X_OPSEC_LLM_MODEL(未指定なら生成
-# モデル)で明示上書きできるようにしてある。
+# 【使用モデル(X_OPSEC_MODEL_WIRING_FIX_SPEC)】opsec は "安いルーティング
+# 判断" ではなく "安全判断" なので、最安の nano ティア(TaskType.ROUTING)には
+# 乗せない。専用の TaskType.X_OPSEC_REWRITE で LLMRouter を通し、既定は生成
+# モデル相当(settings.openai_model、現状 gpt-5.4-mini)へ解決する
+# (_LOCAL_TASK_TYPES に含めないため OpenAI 固定=安全判断を Ollama 任せに
+# しない)。X_OPSEC_LLM_MODEL(または rewrite_for_opsec(model=))を指定すると、
+# その値が override_model として router.chat に渡り、既定より優先される
+# (=実際に効く。将来ローカル LLM へ寄せる差し込み口も同じ経路)。実際に
+# 使ったモデル名は INFO ログと OpsecResult.model に載る。
 
 from __future__ import annotations
 
@@ -40,11 +44,15 @@ class OpsecResult:
     safe_text : 投稿してよい書き直し後テキスト(actionable な具体だけ除去)。
     changed   : 元テキストから何か書き直したか(False=素通しでよい)。
     removed   : 除去した actionable 情報の説明(ログ・検証用)。
+    model     : 実際に opsec 判定へ使ったモデル/バックエンドの表示名(可観測性
+                用、例 "openai:gpt-5.4-mini")。フォールバック挙動には影響しない
+                追加フィールド(X_OPSEC_MODEL_WIRING_FIX_SPEC)。
     """
 
     safe_text: str
     changed: bool
     removed: list[str] = field(default_factory=list)
+    model: str = ""
 
 
 # ─── LLM プロンプト ───────────────────────────────────────────────────────
@@ -85,11 +93,13 @@ _SYSTEM_PROMPT = (
 
 
 def _resolve_model(model: str | None) -> str | None:
-    """使用モデルを 1 箇所で解決する(将来のローカル差し替え口)。
+    """opsec 判定に使う明示モデル(override)を 1 箇所で解決する。
 
-    優先順: 明示引数 model > settings.x_opsec_llm_model > None(=生成モデル)。
-    None を返した場合、呼び出し側は LLMRouter に TaskType.ROUTING を渡し、
-    生成と同じモデル階層(OpenAI openai_model、または Ollama)を使う。
+    優先順: 明示引数 model > settings.x_opsec_llm_model > None。
+    None を返した場合は override 無し=TaskType.X_OPSEC_REWRITE の既定
+    (settings.openai_model、生成モデル相当)が使われる。非 None の場合は、
+    その値が router.chat(override_model=) に渡り、既定より優先される
+    (X_OPSEC_MODEL_WIRING_FIX_SPEC)。
     """
     return model or settings.x_opsec_llm_model or None
 
@@ -104,14 +114,25 @@ async def rewrite_for_opsec(text: str, *, model: str | None = None) -> OpsecResu
       では元/(空)/理由をログに残して検証できる(素通しさせない)。
     """
     original = text or ""
-    if not original.strip():
-        return OpsecResult(safe_text=original, changed=False, removed=[])
-
     resolved = _resolve_model(model)
     router = get_llm_router()
+
+    # 実際に使う(予定の)モデル名を先に解決してログ・結果に載せる(可観測性)。
+    try:
+        model_name = await router.resolve_model_name(
+            TaskType.X_OPSEC_REWRITE, override_model=resolved
+        )
+    except Exception:
+        # 名前解決の失敗は判定本体を止めない(override 有無だけは残す)。
+        model_name = f"openai:{resolved}" if resolved else "openai:default"
+
+    if not original.strip():
+        return OpsecResult(safe_text=original, changed=False, removed=[], model=model_name)
+
+    logger.info("x_opsec_rewrite: opsec judge model=%s (override=%s)", model_name, resolved)
     try:
         raw = await router.chat(
-            TaskType.ROUTING,
+            TaskType.X_OPSEC_REWRITE,
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": original},
@@ -119,20 +140,18 @@ async def rewrite_for_opsec(text: str, *, model: str | None = None) -> OpsecResu
             temperature=0.0,
             max_tokens=400,
             json_mode=True,
+            override_model=resolved,
         )
     except Exception:
         logger.exception("x_opsec_rewrite: LLM call failed (failing safe: holding post)")
-        return OpsecResult(safe_text="", changed=True, removed=["opsec 判定に失敗(安全側で保留)"])
+        return OpsecResult(
+            safe_text="", changed=True, removed=["opsec 判定に失敗(安全側で保留)"], model=model_name
+        )
 
-    if resolved:
-        # モデル上書きが指定されていたことを可観測にしておく(実際の切替は
-        # LLMRouter 側の設定で行う。ここは解決の一本化と将来の差し込み口)。
-        logger.debug("x_opsec_rewrite: model override requested=%s", resolved)
-
-    return _parse_result(raw, original)
+    return _parse_result(raw, original, model_name)
 
 
-def _parse_result(raw: str, original: str) -> OpsecResult:
+def _parse_result(raw: str, original: str, model_name: str = "") -> OpsecResult:
     """LLM の生出力を OpsecResult へ。パース失敗は安全側(保留)に倒す。"""
     try:
         data = json.loads(raw)
@@ -150,10 +169,13 @@ def _parse_result(raw: str, original: str) -> OpsecResult:
         logger.warning(
             "x_opsec_rewrite: could not parse LLM output as JSON (failing safe: holding post)"
         )
-        return OpsecResult(safe_text="", changed=True, removed=["opsec 判定の出力を解釈できず(安全側で保留)"])
+        return OpsecResult(
+            safe_text="", changed=True,
+            removed=["opsec 判定の出力を解釈できず(安全側で保留)"], model=model_name,
+        )
 
     # changed=False を主張しつつ本文が変わっている等の不整合は、除去された側を
     # 信頼して changed=True に寄せる(actionable を素通しさせないため)。
     if not changed and safe_text != original:
         changed = True
-    return OpsecResult(safe_text=safe_text, changed=changed, removed=removed)
+    return OpsecResult(safe_text=safe_text, changed=changed, removed=removed, model=model_name)

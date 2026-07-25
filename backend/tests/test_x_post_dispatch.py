@@ -63,7 +63,8 @@ def _apply(mock_map, live):
 
 
 def test_shadow_logs_only_and_marks_posted():
-    opsec = OpsecResult(safe_text="おはよう", changed=False, removed=[])
+    # opsec.model は shadow の would-post ログに出す(X_OPSEC_MODEL_WIRING_FIX)。
+    opsec = OpsecResult(safe_text="おはよう", changed=False, removed=[], model="openai:gpt-5.4-mini")
     m = _patches(due=DUE, opsec=opsec, live=False)
     ctxs, marks = _apply(m, live=False)
     try:

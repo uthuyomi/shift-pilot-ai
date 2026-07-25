@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-# X_OPSEC_LLM_REWRITE_SPEC: rewrite_for_opsec() の構造化出力・差し込み・安全側
-# フォールバックの回帰。LLMRouter をダミー注入し、ネットワーク/LLM に依存
-# しない(決定的)。
+# X_OPSEC_LLM_REWRITE_SPEC / X_OPSEC_MODEL_WIRING_FIX_SPEC:
+# rewrite_for_opsec() の構造化出力・差し込み・安全側フォールバック、および
+# opsec 判定モデルの配線(override が効く/既定が nano でない)の回帰。
+# LLMRouter をダミー注入し、ネットワーク/LLM に依存しない(決定的)。
 
 import asyncio
 import json
 from unittest.mock import patch
 
+from app.config import settings
 from app.services import x_opsec_rewrite as mod
+from app.services.local_llm import TaskType, _openai_model_for_task
 from app.services.x_opsec_rewrite import OpsecResult, rewrite_for_opsec
 
 
@@ -17,7 +20,9 @@ def _run(coro):
 
 
 class _DummyRouter:
-    """LLMRouter.chat() 互換のダミー。返す raw 文字列を固定する(または例外)。"""
+    """LLMRouter 互換のダミー。chat() が返す raw を固定(または例外)し、
+    渡された task/override_model を記録する。resolve_model_name() は本物と
+    同じ規則(override 有 → openai:<model>、無 → openai:<tier>)で返す。"""
 
     def __init__(self, *, raw: str | None = None, raises: bool = False):
         self._raw = raw
@@ -29,6 +34,11 @@ class _DummyRouter:
         if self._raises:
             raise RuntimeError("boom")
         return self._raw
+
+    async def resolve_model_name(self, task, *, override_model=None):
+        if override_model:
+            return f"openai:{override_model}"
+        return f"openai:{_openai_model_for_task(task)}"
 
 
 def _with_router(router):
@@ -126,3 +136,61 @@ def test_removed_non_list_is_coerced():
     with _with_router(_DummyRouter(raw=raw)):
         result = _run(rewrite_for_opsec("ポート12345"))
     assert result.removed == ["ポート番号"]
+
+
+# ─── X_OPSEC_MODEL_WIRING_FIX_SPEC: モデル配線 ──────────────────────────
+
+def _ok_raw(text="x"):
+    return json.dumps({"safe_text": text, "changed": False, "removed": []})
+
+
+def test_model_arg_override_reaches_router():
+    # rewrite_for_opsec(model=) が override_model として router.chat に渡り、
+    # X_OPSEC_REWRITE タスクで呼ばれること(nano の ROUTING ではない)。
+    router = _DummyRouter(raw=_ok_raw())
+    with _with_router(router):
+        result = _run(rewrite_for_opsec("何かの投稿", model="gpt-5.5"))
+    call = router.calls[0]
+    assert call["task"] is TaskType.X_OPSEC_REWRITE
+    assert call["kwargs"].get("override_model") == "gpt-5.5"
+    assert result.model == "openai:gpt-5.5"  # 可観測性: 実使用モデル名
+
+
+def test_env_override_reaches_router():
+    # settings.x_opsec_llm_model(= X_OPSEC_LLM_MODEL)が override として効く。
+    router = _DummyRouter(raw=_ok_raw())
+    with _with_router(router), patch.object(settings, "x_opsec_llm_model", "gpt-5.5"):
+        result = _run(rewrite_for_opsec("何かの投稿"))
+    assert router.calls[0]["kwargs"].get("override_model") == "gpt-5.5"
+    assert result.model == "openai:gpt-5.5"
+
+
+def test_explicit_arg_beats_env():
+    router = _DummyRouter(raw=_ok_raw())
+    with _with_router(router), patch.object(settings, "x_opsec_llm_model", "from-env"):
+        _run(rewrite_for_opsec("何かの投稿", model="from-arg"))
+    assert router.calls[0]["kwargs"].get("override_model") == "from-arg"
+
+
+def test_default_is_not_nano_tier():
+    # 未指定時: override なし & 既定ティアが nano(最安)ではなく生成モデル相当。
+    router = _DummyRouter(raw=_ok_raw())
+    with _with_router(router), patch.object(settings, "x_opsec_llm_model", None):
+        result = _run(rewrite_for_opsec("何かの投稿"))
+    assert router.calls[0]["task"] is TaskType.X_OPSEC_REWRITE
+    assert router.calls[0]["kwargs"].get("override_model") is None
+    # 既定は openai_model(生成相当)であって openai_nano_model ではない。
+    default_tier = _openai_model_for_task(TaskType.X_OPSEC_REWRITE)
+    assert default_tier == settings.openai_model
+    assert default_tier != settings.openai_nano_model
+    assert result.model == f"openai:{settings.openai_model}"
+
+
+def test_fallback_carries_model_name():
+    # フォールバック(保留)でも実使用予定モデル名が結果に載る(shadow ログ用)。
+    router = _DummyRouter(raises=True)
+    with _with_router(router), patch.object(settings, "x_opsec_llm_model", "gpt-5.5"):
+        result = _run(rewrite_for_opsec("何かの投稿"))
+    assert result.safe_text == ""  # フォールバック不変
+    assert result.changed is True
+    assert result.model == "openai:gpt-5.5"
