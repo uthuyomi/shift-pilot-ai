@@ -845,6 +845,89 @@ async def opsec_test(
     }
 
 
+# ─── /api/agent/x/post ────────────────────────────────────────────────────────
+#
+# X_OPSEC_LINE_B_AND_MANUAL_POST_SPEC: cron・予約(scheduled_at)を待たず、
+# 「今すぐこの内容をツイートする」ための手動投稿エンドポイント。人間(開発者)の
+# 明示指示による投稿なので、自律投稿の頻度・予算の門番である Executive Gate は
+# 通さない(手動投稿は Gate の対象外)。opsec 書き直し(立場B)と記憶 private 値の
+# 逐語一致チェックは、自律 dispatch と同じく必ず通す。standalone スクリプトは
+# 追加せず、稼働中の uvicorn プロセス内でのみ実行する(JWT desync 回避)。
+
+
+class ManualPostRequest(BaseModel):
+    text: str = Field(description="今すぐ投稿する本文候補")
+
+
+@router.post("/x/post")
+async def x_manual_post(
+    payload: ManualPostRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    jwt = _require_jwt(authorization)
+
+    if not (payload.text or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "text is required and must be non-empty."},
+        )
+
+    from app.services.x_opsec_rewrite import rewrite_for_opsec  # noqa: PLC0415
+    from app.services.x_privacy_filter import filter_private_facts  # noqa: PLC0415
+
+    # 1. opsec 書き直し(立場B)。safe_text が空(安全側保留)なら投稿しない。
+    res = await rewrite_for_opsec(payload.text)
+    safe_text = res.safe_text
+    if not safe_text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "reason": "opsec_hold", "removed": res.removed},
+        )
+
+    # 2. 記憶 private 値の逐語一致(自律 dispatch と同じ)。リクエストの Bearer
+    #    トークン(=呼び出し元ユーザーの JWT)で確認する。
+    facts_ok, blocked = await filter_private_facts(safe_text, jwt)
+    if not facts_ok:
+        raise HTTPException(
+            status_code=422,
+            detail={"ok": False, "reason": "private_facts", "blocked": blocked},
+        )
+
+    # 3. Executive Gate は通さない(手動=人間の明示指示のため。上記 docstring)。
+
+    base = {
+        "original": payload.text,
+        "safe_text": safe_text,
+        "changed": res.changed,
+        "removed": res.removed,
+    }
+
+    # 4/5. live(X_ENABLED かつ X_CATEGORIZED_POST_LIVE)なら実投稿、そうでなけ
+    #      れば shadow(投稿せず safe_text を返す=live 前のリハーサル)。
+    if not (settings.x_enabled and settings.x_categorized_post_live):
+        return {"ok": True, "posted": False, "shadow": True, **base}
+
+    from app.services.x_post_generator import record_post  # noqa: PLC0415
+    from app.services.x_publisher import get_publisher  # noqa: PLC0415
+
+    try:
+        publisher = get_publisher()
+        tweet_id = await publisher.post_tweet(safe_text)
+        if not tweet_id:
+            raise HTTPException(
+                status_code=502,
+                detail={"ok": False, "reason": "publisher_returned_none", **base},
+            )
+        await record_post(safe_text, "manual", tweet_id=tweet_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("x/post manual publish failed")
+        raise HTTPException(status_code=500, detail={"error": str(exc)}) from exc
+
+    return {"ok": True, "posted": True, "tweet_id": tweet_id, **base}
+
+
 # ─── /api/agent/self/ ────────────────────────────────────────────────────────
 
 
